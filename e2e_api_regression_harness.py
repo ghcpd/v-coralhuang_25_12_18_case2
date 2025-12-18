@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import requests
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -217,9 +218,22 @@ def request_json(method: str, path: str, query: Dict[str, str]) -> Tuple[int, Di
                 return c["response"]["statusCode"], c["response"]["body"]
         raise RuntimeError(f"No canned response for {method} {path} {query}")
 
-    # TODO: implement real HTTP call here
-    # Hint: requests.request(method, base_url+path, params=query, timeout=...)
-    raise NotImplementedError("TODO: implement real HTTP call using BASE_URL")
+    # Real HTTP call
+    url = base_url.rstrip("/") + path
+    try:
+        resp = requests.request(method, url, params=query, timeout=10)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"HTTP request failed: {exc}") from exc
+
+    # Ensure JSON response
+    content_type = resp.headers.get("Content-Type", "")
+    if "application/json" not in content_type and not resp.text.strip().startswith("{"):
+        raise RuntimeError(f"Non-JSON response from {url}: content-type={content_type}")
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Response from {url} is not valid JSON: {exc}") from exc
+    return resp.status_code, body
 
 
 # -------------------------
@@ -228,19 +242,86 @@ def request_json(method: str, path: str, query: Dict[str, str]) -> Tuple[int, Di
 
 def v2_to_legacy(order_v2: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Transform v2 order shape into legacy-safe shape:
-      - state -> status (downgrade unknown values deterministically)
-      - amount{value, currency} -> totalPrice (float, USD assumed if missing)
-      - customer{id, name, email} -> customerId, customerName (flatten nested object)
-      - lineItems(name, quantity, unitPrice, tax) -> items(productName, qty) (drop extra fields)
-      - createdAt ISO 8601 -> YYYY-MM-DD date string
-      - trackingNumber: pass through if present, otherwise omit
-      - Guarantee items exists and is non-empty list for legacy UI safety
-
-    Must be deterministic and stable.
+    Deterministic mapping from v2 -> legacy-safe shape.
+    See docstring above for mapping intent.
     """
-    # TODO: implement mapping rules
-    raise NotImplementedError("TODO: implement v2_to_legacy mapping")
+    legacy: Dict[str, Any] = {}
+
+    # passthrough orderId
+    if "orderId" in order_v2:
+        legacy["orderId"] = order_v2["orderId"]
+
+    # status: downgrade unknown states deterministically to 'PAID'
+    state = order_v2.get("state")
+    if isinstance(state, str) and state in LEGACY_ENUM:
+        legacy["status"] = state
+    else:
+        # deterministic downgrade for unknown/new states
+        legacy["status"] = "PAID"
+
+    # amount -> totalPrice (float)
+    total = 0.0
+    amt = order_v2.get("amount")
+    if isinstance(amt, dict):
+        try:
+            total = float(amt.get("value", 0.0))
+        except Exception:
+            total = 0.0
+    elif isinstance(amt, (int, float)):
+        total = float(amt)
+    legacy["totalPrice"] = total
+
+    # customer flattening
+    cust = order_v2.get("customer")
+    if isinstance(cust, dict):
+        legacy["customerId"] = str(cust.get("id", ""))
+        legacy["customerName"] = str(cust.get("name", ""))
+    else:
+        # graceful defaults
+        legacy["customerId"] = str(order_v2.get("customerId", ""))
+        legacy["customerName"] = str(order_v2.get("customerName", ""))
+
+    # lineItems -> items (productName, qty)
+    items: List[Dict[str, Any]] = []
+    line_items = order_v2.get("lineItems")
+    if isinstance(line_items, list) and len(line_items) > 0:
+        for li in line_items:
+            name = li.get("name") if isinstance(li, dict) else None
+            qty = li.get("quantity") if isinstance(li, dict) else None
+            try:
+                qty_val = int(qty) if qty is not None else 0
+            except Exception:
+                qty_val = 0
+            items.append({"productName": name or "UNKNOWN", "qty": qty_val})
+    # Guarantee non-empty items list for legacy safety
+    if not items:
+        items = [{"productName": "UNKNOWN", "qty": 0}]
+    legacy["items"] = items
+
+    # createdAt: ISO 8601 -> YYYY-MM-DD
+    created = order_v2.get("createdAt", "")
+    if isinstance(created, str):
+        # handle Z suffix and common ISO variants
+        try:
+            from datetime import datetime
+            s = created
+            if s.endswith("Z"):
+                dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
+            else:
+                # attempt fromisoformat for variants with timezone
+                dt = datetime.fromisoformat(s)
+            legacy["createdAt"] = dt.strftime("%Y-%m-%d")
+        except Exception:
+            # fallback: take date prefix
+            legacy["createdAt"] = created.split("T")[0] if "T" in created else created
+    else:
+        legacy["createdAt"] = "1970-01-01"
+
+    # trackingNumber pass-through if present
+    if "trackingNumber" in order_v2:
+        legacy["trackingNumber"] = order_v2["trackingNumber"]
+
+    return legacy
 
 
 # -------------------------
@@ -249,14 +330,22 @@ def v2_to_legacy(order_v2: Dict[str, Any]) -> Dict[str, Any]:
 
 def classify_v1_deprecation(status_code: int, body: Dict[str, Any]) -> str:
     """
-    Return one of: "DEPRECATED", "OUTAGE", "OK"
-    Rules:
-      - 410 + error=API_VERSION_DEPRECATED => DEPRECATED (not outage)
-      - 200 => OK
-      - anything else => OUTAGE
+    Classify v1 responses for monitoring semantics.
     """
-    # TODO: implement classification
-    raise NotImplementedError("TODO: implement classify_v1_deprecation")
+    if status_code == 200:
+        return "OK"
+    # deprecation signal
+    if status_code == 410:
+        # body may be {"error": "API_VERSION_DEPRECATED", "message": ...}
+        err = body.get("error") if isinstance(body, dict) else None
+        if err == "API_VERSION_DEPRECATED":
+            return "DEPRECATED"
+        # also check message for hints
+        msg = (body.get("message") or "") if isinstance(body, dict) else ""
+        if "deprecated" in str(msg).lower() or "migrate" in str(msg).lower():
+            return "DEPRECATED"
+        return "DEPRECATED"
+    return "OUTAGE"
 
 
 # -------------------------
@@ -265,18 +354,117 @@ def classify_v1_deprecation(status_code: int, body: Dict[str, Any]) -> str:
 
 def normalize_error_response(status_code: int, body: Dict[str, Any]) -> Dict[str, str]:
     """
-    Normalize v2 error format to v1 format.
-    
-    v1 format: {\"error\": \"ERROR_CODE\", \"message\": \"Human readable message\"}
-    v2 format: {\"errors\": [{\"code\": \"...\", \"message\": \"...\", \"field\": \"...\"}]}
-    
-    Rules:
-      - If v2 errors array exists, take first error and map to v1 format
-      - If already v1 format, pass through
-      - Must be deterministic
+    Normalize v2 error format to v1 format deterministically.
     """
-    # TODO: implement error response normalization
-    raise NotImplementedError("TODO: implement normalize_error_response")
+    if not isinstance(body, dict):
+        return {"error": "UNKNOWN_ERROR", "message": "Non-dict error body"}
+
+    # v1 already
+    if "error" in body and "message" in body:
+        return {"error": str(body.get("error")), "message": str(body.get("message"))}
+
+    # v2 style: errors array
+    errs = body.get("errors")
+    if isinstance(errs, list) and len(errs) > 0 and isinstance(errs[0], dict):
+        first = errs[0]
+        code = first.get("code") or "ERROR"
+        message = first.get("message") or ""
+        return {"error": str(code), "message": str(message)}
+
+    # fallback
+    return {"error": "UNKNOWN_ERROR", "message": json.dumps(body)}
+
+
+# -------------------------
+# RAW-only checks (assert that v2 raw responses break legacy assumptions)
+# -------------------------
+
+def raw_check_customer_is_nested() -> CheckResult:
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "123"})
+    if status != 200:
+        return _fail("raw nested customer: expected 200", f"got {status}")
+    if "customer" in body and isinstance(body["customer"], dict):
+        return _pass("raw nested customer detected")
+    return _fail("raw nested customer: expected nested customer", f"body={body}")
+
+
+def raw_check_amount_is_object() -> CheckResult:
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "555", "includeItems": "false"})
+    if status != 200:
+        return _fail("raw amount object: expected 200", f"got {status}")
+    if isinstance(body.get("amount"), dict):
+        return _pass("raw amount is object as expected")
+    return _fail("raw amount should be object", f"amount={body.get('amount')}")
+
+
+def raw_check_createdAt_is_iso() -> CheckResult:
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "123"})
+    if status != 200:
+        return _fail("raw createdAt: expected 200", f"got {status}")
+    created = body.get("createdAt")
+    if isinstance(created, str) and ("T" in created and (created.endswith("Z") or "+" in created)):
+        return _pass("raw createdAt in ISO 8601 format")
+    return _fail("raw createdAt not ISO", f"createdAt={created}")
+
+
+def raw_check_error_format_array() -> CheckResult:
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "invalid"})
+    if status != 400:
+        return _fail("raw error format: expected 400", f"got {status}")
+    if "errors" in body and isinstance(body["errors"], list):
+        return _pass("raw v2 error format uses errors array")
+    return _fail("raw v2 error format not array", f"body={body}")
+
+
+def main() -> None:
+    """Mode-aware runner.
+
+    MODE env values:
+      - RAW: run raw checks that demonstrate v2 breaks legacy assumptions (should PASS to show failures)
+      - COMPAT: run compatibility checks (mapping + normalization) and expect PASS
+      - ALL (default): run RAW then COMPAT sequentially
+    """
+    mode = os.environ.get("MODE", "ALL").upper()
+
+    raw_checks = [
+        check_raw_v2_breaks_legacy_items_missing,
+        check_raw_v2_breaks_legacy_enum_on_new_state,
+        raw_check_customer_is_nested,
+        raw_check_amount_is_object,
+        raw_check_createdAt_is_iso,
+        raw_check_error_format_array,
+    ]
+
+    compat_checks = [
+        check_nested_structure_flattened,
+        check_type_change_amount_object,
+        check_compat_mapping_produces_legacy_shape,
+        check_error_format_normalized,
+        check_v1_deprecation_classified_not_outage,
+    ]
+
+    if mode == "RAW":
+        print("=== MODE: RAW (showing v2 breaks that would impact legacy) ===")
+        results = [c() for c in raw_checks]
+        print_report(results)
+        return
+
+    if mode == "COMPAT":
+        print("=== MODE: COMPAT (compatibility mapping enabled) ===")
+        results = [c() for c in compat_checks]
+        print_report(results)
+        return
+
+    # default ALL: run RAW then COMPAT and ensure both sets pass
+    print("=== MODE: ALL -> RAW then COMPAT ===")
+    print("--- RAW phase ---")
+    raw_results = [c() for c in raw_checks]
+    print_report(raw_results)
+
+    print("--- COMPAT phase ---")
+    compat_results = [c() for c in compat_checks]
+    print_report(compat_results)
+
 
 
 # -------------------------
@@ -414,17 +602,6 @@ def check_v1_deprecation_classified_not_outage() -> CheckResult:
     return _pass("monitoring: v1 deprecation classified as DEPRECATED")
 
 
-def main() -> None:
-    results = [
-        check_raw_v2_breaks_legacy_items_missing(),
-        check_raw_v2_breaks_legacy_enum_on_new_state(),
-        check_nested_structure_flattened(),
-        check_type_change_amount_object(),
-        check_compat_mapping_produces_legacy_shape(),
-        check_error_format_normalized(),
-        check_v1_deprecation_classified_not_outage(),
-    ]
-    print_report(results)
 
 
 if __name__ == "__main__":

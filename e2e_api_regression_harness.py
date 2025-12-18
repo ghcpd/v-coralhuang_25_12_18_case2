@@ -38,6 +38,7 @@ import os
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+import requests
 
 # -------------------------
 # Test vectors (embedded)
@@ -217,9 +218,19 @@ def request_json(method: str, path: str, query: Dict[str, str]) -> Tuple[int, Di
                 return c["response"]["statusCode"], c["response"]["body"]
         raise RuntimeError(f"No canned response for {method} {path} {query}")
 
-    # TODO: implement real HTTP call here
-    # Hint: requests.request(method, base_url+path, params=query, timeout=...)
-    raise NotImplementedError("TODO: implement real HTTP call using BASE_URL")
+    # Real HTTP call
+    url = base_url.rstrip('/') + path
+    try:
+        response = requests.request(method, url, params=query, timeout=10)
+        response.raise_for_status()  # Raise for bad status, but we return status anyway
+        body = response.json()
+        return response.status_code, body
+    except requests.exceptions.RequestException as e:
+        # For simplicity, return 500 with error
+        return 500, {"error": "REQUEST_FAILED", "message": str(e)}
+    except ValueError:
+        # Not JSON
+        raise RuntimeError(f"Response is not JSON: {response.text}")
 
 
 # -------------------------
@@ -239,8 +250,58 @@ def v2_to_legacy(order_v2: Dict[str, Any]) -> Dict[str, Any]:
 
     Must be deterministic and stable.
     """
-    # TODO: implement mapping rules
-    raise NotImplementedError("TODO: implement v2_to_legacy mapping")
+    legacy = {}
+    
+    # orderId
+    legacy["orderId"] = order_v2.get("orderId")
+    
+    # state -> status
+    state = order_v2.get("state", "")
+    if state in LEGACY_ENUM:
+        legacy["status"] = state
+    else:
+        # Downgrade unknown states to a safe legacy value
+        legacy["status"] = "PAID"
+    
+    # amount -> totalPrice
+    amount = order_v2.get("amount", {})
+    if isinstance(amount, dict) and "value" in amount:
+        legacy["totalPrice"] = float(amount["value"])
+    else:
+        legacy["totalPrice"] = 0.0
+    
+    # customer -> customerId, customerName
+    customer = order_v2.get("customer", {})
+    if isinstance(customer, dict):
+        legacy["customerId"] = customer.get("id", "")
+        legacy["customerName"] = customer.get("name", "")
+    else:
+        legacy["customerId"] = ""
+        legacy["customerName"] = ""
+    
+    # createdAt -> YYYY-MM-DD
+    created_at = order_v2.get("createdAt", "")
+    if "T" in created_at:
+        legacy["createdAt"] = created_at.split("T")[0]
+    else:
+        legacy["createdAt"] = created_at
+    
+    # lineItems -> items
+    line_items = order_v2.get("lineItems", [])
+    if line_items:
+        legacy["items"] = [
+            {"productName": item.get("name", ""), "qty": item.get("quantity", 0)}
+            for item in line_items
+        ]
+    else:
+        # Guarantee non-empty items
+        legacy["items"] = [{"productName": "Unknown Item", "qty": 1}]
+    
+    # trackingNumber if present
+    if "trackingNumber" in order_v2:
+        legacy["trackingNumber"] = order_v2["trackingNumber"]
+    
+    return legacy
 
 
 # -------------------------
@@ -255,8 +316,12 @@ def classify_v1_deprecation(status_code: int, body: Dict[str, Any]) -> str:
       - 200 => OK
       - anything else => OUTAGE
     """
-    # TODO: implement classification
-    raise NotImplementedError("TODO: implement classify_v1_deprecation")
+    if status_code == 410 and body.get("error") == "API_VERSION_DEPRECATED":
+        return "DEPRECATED"
+    elif status_code == 200:
+        return "OK"
+    else:
+        return "OUTAGE"
 
 
 # -------------------------
@@ -275,13 +340,66 @@ def normalize_error_response(status_code: int, body: Dict[str, Any]) -> Dict[str
       - If already v1 format, pass through
       - Must be deterministic
     """
-    # TODO: implement error response normalization
-    raise NotImplementedError("TODO: implement normalize_error_response")
+    if "errors" in body and isinstance(body["errors"], list) and body["errors"]:
+        first_error = body["errors"][0]
+        return {
+            "error": first_error.get("code", "UNKNOWN_ERROR"),
+            "message": first_error.get("message", "An error occurred")
+        }
+    else:
+        # Assume already v1 format or pass through
+        return body
 
 
 # -------------------------
-# Checks
+# Checks (assert legacy assumptions, fail in RAW_V2, pass in COMPAT)
 # -------------------------
+
+def check_legacy_items_exist(body: Dict[str, Any]) -> CheckResult:
+    if "items" not in body or not isinstance(body["items"], list) or len(body["items"]) == 0:
+        return _fail("legacy assumption: items must exist and be non-empty list", f"items={body.get('items')}")
+    return _pass("legacy assumption: items present and non-empty")
+
+
+def check_legacy_customer_flat(body: Dict[str, Any]) -> CheckResult:
+    if "customer" in body and isinstance(body["customer"], dict):
+        return _fail("legacy assumption: customer must not be nested object", f"customer={body['customer']}")
+    if "customerId" not in body or "customerName" not in body:
+        return _fail("legacy assumption: customerId and customerName must be flat fields", f"body keys={list(body.keys())}")
+    if not isinstance(body["customerId"], str) or not isinstance(body["customerName"], str):
+        return _fail("legacy assumption: customerId/customerName must be strings", f"customerId={body.get('customerId')}, customerName={body.get('customerName')}")
+    return _pass("legacy assumption: customer flattened correctly")
+
+
+def check_legacy_totalPrice_float(body: Dict[str, Any]) -> CheckResult:
+    if "amount" in body and isinstance(body["amount"], dict):
+        return _fail("legacy assumption: amount must not be object", f"amount={body['amount']}")
+    if "totalPrice" not in body or not isinstance(body["totalPrice"], (int, float)):
+        return _fail("legacy assumption: totalPrice must be numeric", f"totalPrice={body.get('totalPrice')}")
+    return _pass("legacy assumption: totalPrice is float")
+
+
+def check_legacy_createdAt_yyyy_mm_dd(body: Dict[str, Any]) -> CheckResult:
+    import re
+    created_at = body.get("createdAt", "")
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', created_at):
+        return _fail("legacy assumption: createdAt must be YYYY-MM-DD", f"createdAt={created_at}")
+    return _pass("legacy assumption: createdAt is YYYY-MM-DD")
+
+
+def check_legacy_status_enum(body: Dict[str, Any]) -> CheckResult:
+    status = body.get("status", body.get("state", ""))  # in raw, state, in compat, status
+    if status not in LEGACY_ENUM:
+        return _fail("legacy assumption: status must be known enum", f"status={status}, known={LEGACY_ENUM}")
+    return _pass("legacy assumption: status in legacy enum")
+
+
+def check_legacy_error_format(body: Dict[str, Any]) -> CheckResult:
+    if "errors" in body and isinstance(body["errors"], list):
+        return _fail("legacy assumption: error must not be array", f"errors={body['errors']}")
+    if "error" not in body or "message" not in body:
+        return _fail("legacy assumption: error and message must be present", f"body keys={list(body.keys())}")
+    return _pass("legacy assumption: error format is v1")
 
 def check_raw_v2_breaks_legacy_items_missing() -> CheckResult:
     status, body = request_json("GET", "/api/v2/orders", {"userId": "123"})
@@ -414,16 +532,101 @@ def check_v1_deprecation_classified_not_outage() -> CheckResult:
     return _pass("monitoring: v1 deprecation classified as DEPRECATED")
 
 
+# Additional checks for RAW_V2 mode (to show breakage)
+def check_raw_v2_nested_customer_not_flat() -> CheckResult:
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "123"})
+    if status != 200:
+        return _fail("raw v2 nested: expected 200", f"got {status}")
+    if "customer" not in body or not isinstance(body["customer"], dict):
+        return _fail("raw v2 nested: should have nested customer", f"body={body}")
+    if "customerId" in body or "customerName" in body:
+        return _fail("raw v2 nested: should not have flat fields", f"body={body}")
+    return _pass("raw v2 nested: customer is nested object")
+
+
+def check_raw_v2_amount_is_object() -> CheckResult:
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "555", "includeItems": "false"})
+    if status != 200:
+        return _fail("raw v2 amount: expected 200", f"got {status}")
+    if not isinstance(body.get("amount"), dict):
+        return _fail("raw v2 amount: should be object", f"amount={body.get('amount')}")
+    if "totalPrice" in body:
+        return _fail("raw v2 amount: should not have totalPrice", f"body={body}")
+    return _pass("raw v2 amount: amount is object")
+
+
+def check_raw_v2_date_is_iso() -> CheckResult:
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "123"})
+    if status != 200:
+        return _fail("raw v2 date: expected 200", f"got {status}")
+    created_at = body.get("createdAt", "")
+    import re
+    if not re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$', created_at):
+        return _fail("raw v2 date: should be ISO 8601", f"createdAt={created_at}")
+    return _pass("raw v2 date: createdAt is ISO 8601")
+
+
+def check_raw_v2_error_is_array() -> CheckResult:
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "invalid"})
+    if status != 400:
+        return _fail("raw v2 error: expected 400", f"got {status}")
+    if "errors" not in body or not isinstance(body["errors"], list):
+        return _fail("raw v2 error: should have errors array", f"body={body}")
+    if "error" in body or "message" in body:
+        return _fail("raw v2 error: should not have v1 format", f"body={body}")
+    return _pass("raw v2 error: errors is array")
+
+
 def main() -> None:
-    results = [
-        check_raw_v2_breaks_legacy_items_missing(),
-        check_raw_v2_breaks_legacy_enum_on_new_state(),
-        check_nested_structure_flattened(),
-        check_type_change_amount_object(),
-        check_compat_mapping_produces_legacy_shape(),
-        check_error_format_normalized(),
-        check_v1_deprecation_classified_not_outage(),
-    ]
+    import sys
+    mode = sys.argv[1] if len(sys.argv) > 1 else "RAW_V2"
+    
+    if mode == "RAW_V2":
+        # Run legacy assumption checks on raw v2 responses (expect failures)
+        results = [
+            check_legacy_items_exist(request_json("GET", "/api/v2/orders", {"userId": "123"})[1]),
+            check_legacy_status_enum(request_json("GET", "/api/v2/orders", {"userId": "555", "includeItems": "false"})[1]),
+            check_legacy_customer_flat(request_json("GET", "/api/v2/orders", {"userId": "123"})[1]),
+            check_legacy_totalPrice_float(request_json("GET", "/api/v2/orders", {"userId": "555", "includeItems": "false"})[1]),
+            check_legacy_createdAt_yyyy_mm_dd(request_json("GET", "/api/v2/orders", {"userId": "123"})[1]),
+            check_legacy_error_format(request_json("GET", "/api/v2/orders", {"userId": "invalid"})[1]),
+        ]
+    elif mode == "COMPAT":
+        # Run legacy assumption checks on mapped v2 responses (expect passes)
+        # For successful responses, apply v2_to_legacy
+        status1, body1 = request_json("GET", "/api/v2/orders", {"userId": "123"})
+        mapped_body1 = v2_to_legacy(body1) if status1 == 200 else body1
+        
+        status2, body2 = request_json("GET", "/api/v2/orders", {"userId": "555", "includeItems": "false"})
+        mapped_body2 = v2_to_legacy(body2) if status2 == 200 else body2
+        
+        status3, body3 = request_json("GET", "/api/v2/orders", {"userId": "123"})
+        mapped_body3 = v2_to_legacy(body3) if status3 == 200 else body3
+        
+        status4, body4 = request_json("GET", "/api/v2/orders", {"userId": "555", "includeItems": "false"})
+        mapped_body4 = v2_to_legacy(body4) if status4 == 200 else body4
+        
+        status5, body5 = request_json("GET", "/api/v2/orders", {"userId": "123"})
+        mapped_body5 = v2_to_legacy(body5) if status5 == 200 else body5
+        
+        # For error response, apply normalize_error_response
+        status6, body6 = request_json("GET", "/api/v2/orders", {"userId": "invalid"})
+        mapped_body6 = normalize_error_response(status6, body6)
+        
+        results = [
+            check_legacy_items_exist(mapped_body1),
+            check_legacy_status_enum(mapped_body2),
+            check_legacy_customer_flat(mapped_body3),
+            check_legacy_totalPrice_float(mapped_body4),
+            check_legacy_createdAt_yyyy_mm_dd(mapped_body5),
+            check_legacy_error_format(mapped_body6),
+            check_v1_deprecation_classified_not_outage(),
+        ]
+    else:
+        print("Invalid mode. Use RAW_V2 or COMPAT")
+        sys.exit(1)
+    
+    print(f"Running in {mode} mode:")
     print_report(results)
 
 

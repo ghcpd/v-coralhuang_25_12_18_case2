@@ -1,0 +1,76 @@
+You are an experienced backend and integration-focused professional software engineer.
+
+We have an API migration regression:
+
+* `/api/v1/orders` is deprecated and may return HTTP 410 or an error code like `API_VERSION_DEPRECATED`.
+* `/api/v2/orders` introduces a behavior gate: `includeItems` (default false).
+* Schema changes:
+
+  * `status -> state`
+  * `totalPrice -> amount`
+  * `items(productName, qty) -> lineItems(name, quantity)`
+* `/api/v2/orders` may omit `lineItems` entirely when `includeItems` is absent or false.
+* v2 introduces new `state` values (e.g. `FULFILLED`) that may break legacy enums.
+
+Legacy clients assume:
+
+* `items` always exists and is non-empty.
+* `status` and `totalPrice` always exist.
+* enum values are fixed and mapped strictly.
+* `/api/v1/orders` must return HTTP 200; any non-200 is treated as outage by monitoring.
+
+Hard constraints (non-negotiable):
+
+* You MAY NOT change `/api/v2/orders`.
+* You MAY NOT change legacy clients.
+* You MUST solve this using a compatibility layer (gateway/adapter/middleware) and regression tests.
+
+### Mandatory Deliverables
+
+1. **Compatibility mapping spec**
+   Provide deterministic mapping rules that transform v2 responses into a legacy-safe shape (including enum downgrade and items/lineItems handling).
+
+2. **Regression tests with a strict FAIL-THEN-PASS gate**
+   You MUST implement tests that run in two modes against the same scenarios:
+
+* **Mode A: RAW_V2 mode** (no compatibility mapping)
+
+  * The test suite MUST demonstrate failures for legacy assumptions (at least: missing items, enum expansion, includeItems omission behavior).
+* **Mode B: COMPAT mode** (compatibility mapping enabled)
+
+  * The exact same scenarios MUST pass after applying your compatibility mapping.
+
+This requirement is strict: tests must explicitly show **failures in Mode A** and **passes in Mode B**, and the output must clearly separate the two runs.
+
+3. **Monitoring correction + test**
+   You MUST define and test a rule that classifies `/api/v1/orders` deprecation responses as **DEPRECATED**, not **OUTAGE**, and show how the legacy monitor would otherwise false-alarm.
+
+4. **One-click test runner**
+   Provide a `run_tests` script (`run_tests.sh` and/or `run_tests.ps1`) that:
+
+* Creates/activates an environment
+* Installs dependencies
+* Runs Mode A then Mode B automatically
+* Prints clear PASS/FAIL summaries for both modes
+* Exits non-zero if the FAIL-THEN-PASS gate is not satisfied
+
+5. **Reusable environment definition**
+   Provide:
+
+* `requirements.txt` (minimal, pinned runtime deps)
+* `requirements-dev.txt` (pinned test deps)
+
+6. **README**
+   Provide a short, audit-ready README that explains:
+
+* What changed between v1 and v2
+* What broke and why
+* The compatibility mapping strategy
+* How to run `run_tests`
+* What output indicates the migration is safe for legacy consumers (including the required Mode A FAIL and Mode B PASS behavior)
+
+### Implementation Note
+
+Use the provided starter script as the test harness. You must implement the TODO sections and make the COMPAT mode pass.
+You must keep output technically precise and directly runnable.
+

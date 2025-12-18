@@ -1,0 +1,253 @@
+User: You are an experienced backend and integration-focused professional software engineer.
+
+We have an API migration regression with complex schema mismatches:
+
+* `/api/v1/orders` is deprecated and may return HTTP 410 or an error code like `API_VERSION_DEPRECATED`.
+* `/api/v2/orders` introduces a behavior gate: `includeItems` (default false).
+* Schema changes (structural mismatches):
+
+  1. Nested structure change: 
+     - v1: `customerId` (string), `customerName` (string) - flat fields
+     - v2: `customer{id, name, email}` - nested object
+     - email may be missing in some responses
+
+  2. Type change: 
+     - v1: `totalPrice` (float) - simple numeric value
+     - v2: `amount{value, currency}` - structured object
+
+  3. Date format change:
+     - v1: `createdAt` "YYYY-MM-DD" - simple date string
+     - v2: `createdAt` ISO 8601 "YYYY-MM-DDTHH:MM:SSZ" - full timestamp
+
+  4. Field rename + structure:
+     - v1: `status` (string enum)
+     - v2: `state` (string enum with NEW values)
+
+  5. Array element structure change:
+     - v1: `items[]{productName, qty}` - simple structure
+     - v2: `lineItems[]{name, quantity, unitPrice, tax}` - enriched structure
+
+  6. Conditional field requirements:
+     - v2: when `state=SHIPPED`, `trackingNumber` is present
+     - Legacy doesn't expect this field
+
+  7. Error response format change:
+     - v1: `{error: string, message: string}` - simple error
+     - v2: `{errors: [{code, message, field}]}` - structured error array
+
+* `/api/v2/orders` may omit `lineItems` entirely when `includeItems` is absent or false.
+* v2 introduces new `state` values (e.g. `FULFILLED`) that may break legacy enums.
+
+Legacy clients assume:
+
+* `items` always exists and is non-empty.
+* `status` and `totalPrice` always exist and are primitives (string/float).
+* `customerId` and `customerName` are flat top-level fields.
+* `createdAt` is a simple "YYYY-MM-DD" date string.
+* enum values are fixed and mapped strictly.
+* Error responses use `{error, message}` format (not arrays).
+* `/api/v1/orders` must return HTTP 200; any non-200 is treated as outage by monitoring.
+
+Hard constraints (non-negotiable):
+
+* You MAY NOT change `/api/v2/orders`.
+* You MAY NOT change legacy clients.
+* You MUST solve this using a compatibility layer (gateway/adapter/middleware) and regression tests.
+
+### Mandatory Deliverables
+
+1. Compatibility mapping spec
+   Provide deterministic mapping rules that transform v2 responses into a legacy-safe shape:
+   - Handle nested object flattening (customer → customerId/customerName)
+   - Handle type conversion (amount object → totalPrice float)
+   - Handle date format conversion (ISO 8601 → YYYY-MM-DD)
+   - Handle array element structure changes (drop extra fields)
+   - Handle enum downgrade and items/lineItems handling
+   - Handle missing optional fields gracefully
+
+2. Error response normalization
+   Provide rules to normalize v2 error format `{errors: [...]}` to v1 format `{error, message}`
+
+3. Regression tests with a strict FAIL-THEN-PASS gate
+   You MUST implement tests that run in two modes against the same scenarios:
+
+* **Mode A: RAW_V2 mode** (no compatibility mapping)
+
+  * The test suite MUST demonstrate failures for legacy assumptions:
+    - Missing items
+    - Nested customer structure (not flat)
+    - amount as object (not float)
+    - ISO 8601 date format (not YYYY-MM-DD)
+    - New enum values
+    - Error format with arrays
+
+* **Mode B: COMPAT mode** (compatibility mapping enabled)
+
+  * The exact same scenarios MUST pass after applying your compatibility mapping.
+
+This requirement is strict: tests must explicitly show **failures in Mode A** and **passes in Mode B**, and the output must clearly separate the two runs.
+
+4. Monitoring correction + test
+   You MUST define and test a rule that classifies `/api/v1/orders` deprecation responses as DEPRECATED, not OUTAGE, and show how the legacy monitor would otherwise false-alarm.
+
+5. One-click test runner
+   Provide a `run_tests` script (`run_tests.sh` and/or `run_tests.ps1`) that:
+
+* Creates/activates an environment
+* Installs dependencies
+* Runs Mode A then Mode B automatically
+* Prints clear PASS/FAIL summaries for both modes
+* Exits non-zero if the FAIL-THEN-PASS gate is not satisfied
+
+6. Reusable environment definition
+   Provide:
+
+* `requirements.txt` (minimal, pinned runtime deps)
+* `requirements-dev.txt` (pinned test deps)
+
+7. README
+   Provide a short, audit-ready README that explains:
+
+* What changed between v1 and v2 (including schema changes)
+* What broke and why (be specific about type/structure mismatches)
+* The compatibility mapping strategy (including normalization rules)
+* How to run `run_tests`
+* What output indicates the migration is safe for legacy consumers (including the required Mode A FAIL and Mode B PASS behavior)
+
+### Implementation Note
+
+Use the provided starter script as the test harness. You must implement the TODO sections:
+1. `request_json()` - HTTP client
+2. `v2_to_legacy()` - mapping rules (nested, type, date, array handling)
+3. `classify_v1_deprecation()` - monitoring semantics
+4. `normalize_error_response()` - error format normalization
+
+You must make the COMPAT mode pass ALL checks.
+You must keep output technically precise and directly runnable.
+
+
+
+GitHub Copilot: Optimizing tool selection...Perfect — I’ll implement the compatibility mapping, error normalization, monitoring classification, add Mode A/Mode B test runs, and provide scripts and docs. My next step is to create a short todo plan and start implementing the code changes in the harness.
+
+Created 8 todos
+
+My next step is to implement the code changes in e2e_api_regression_harness.py (TODOs and Mode handling). I'll update the file now.
+
+Read [](file:///c%3A/Bug_Bash/25_12_18/v-coralhuang_25_12_18_case2/e2e_api_regression_harness.py)
+
+Proceeding to implement the code changes in e2e_api_regression_harness.py: request_json, v2_to_legacy, classify_v1_deprecation, normalize_error_response, add RAW_V2/COMPAT mode handling and legacy expectation checks.
+
+Using "Multi-Replace String in Files"
+
+
+```
+
+```
+
+
+Created [](file:///c%3A/Bug_Bash/25_12_18/v-coralhuang_25_12_18_case2/run_tests.sh)
+
+Created [](file:///c%3A/Bug_Bash/25_12_18/v-coralhuang_25_12_18_case2/run_tests.ps1)
+
+Created [](file:///c%3A/Bug_Bash/25_12_18/v-coralhuang_25_12_18_case2/requirements.txt)
+
+Created [](file:///c%3A/Bug_Bash/25_12_18/v-coralhuang_25_12_18_case2/requirements-dev.txt)
+
+Created [](file:///c%3A/Bug_Bash/25_12_18/v-coralhuang_25_12_18_case2/README.md)
+
+Proceeding to run the test scripts: I will execute the PowerShell runner to validate RAW_V2 fails and COMPAT passes.
+
+Ran terminal command: pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File run_tests.ps1
+
+Ran terminal command: powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File run_tests.ps1
+
+Made changes.
+
+User: @agent Try Again
+
+GitHub Copilot: Perfect! I found COMPAT mode still runs some raw-break checks and the PowerShell runner sets $PYTHON incorrectly; I'll add a mapping-specific check for downgrading new state values and fix the PowerShell $PYTHON assignment, then re-run the runner.
+
+Using "Replace String in File"
+
+
+```
+
+```
+
+
+Using "Replace String in File"
+
+
+```
+
+```
+
+
+Ran terminal command: powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File run_tests.ps1
+
+I'm going to fix the PowerShell runner to use $LASTEXITCODE so Mode A failures are detected reliably, then re-run the test script.
+
+Using "Replace String in File"
+
+
+```
+
+```
+
+
+Ran terminal command: powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File run_tests.ps1
+
+Wrap up — Great! The harness now demonstrates the required FAIL-then-PASS behavior and includes the compatibility mapping, normalization, monitoring classification, and runnable scripts.
+
+What I changed (summary)
+- Implemented real-client behavior in `request_json()` (uses `requests` when `BASE_URL` is set; offline uses embedded fixtures) ✅
+- Implemented deterministic compatibility mapping in `v2_to_legacy()`:
+  - Flatten `customer` → `customerId`, `customerName`
+  - `amount{value,currency}` → `totalPrice` (float; fallback 0.0)
+  - ISO 8601 `createdAt` → `YYYY-MM-DD`
+  - `lineItems[]` → `items[]` stripping extra fields and injecting placeholder if missing
+  - Downgrade unknown `state` → deterministic safe default (`PAID`) so it matches `LEGACY_ENUM`
+  - `trackingNumber` passthrough if present
+- Implemented `classify_v1_deprecation()`:
+  - 200 → OK
+  - 410 + error == API_VERSION_DEPRECATED → DEPRECATED
+  - otherwise → OUTAGE
+- Implemented `normalize_error_response()`:
+  - v2 `{errors: [...]}` → take first error → `{error, message}`
+  - pass-through v1 format
+  - fallback to `HTTP_<status>` error code
+- Added explicit Mode runs:
+  - RAW_V2 (legacy assumptions against raw v2) — expected to FAIL
+  - COMPAT (compatibility mapping enabled) — expected to PASS
+- Added run_tests.sh and run_tests.ps1 — one-click runners that create venv, install deps, run Mode A then Mode B and enforce FAIL-then-PASS gate
+- Added requirements.txt and requirements-dev.txt (pinned minimal deps)
+- Wrote README.md explaining the mapping, tests, and how to run
+
+Files added/modified
+- Modified: e2e_api_regression_harness.py — implemented TODOs, added mode handling, added mapping tests
+- Added: run_tests.sh, run_tests.ps1 — one-click test runners
+- Added: requirements.txt, requirements-dev.txt
+- Added: README.md
+
+How to run locally (quick)
+- Unix/macOS:
+  - run_tests.sh
+- Windows PowerShell:
+  - run_tests.ps1
+
+What to look for in output (audit-ready)
+- Mode A (RAW_V2) must show FAILs for legacy assumptions (demonstrates breakages)
+- Mode B (COMPAT) must show ALL PASS after the mapping and normalization (compatibility gate satisfied)
+
+Next steps / optional improvements (if you want)
+- Add unit tests (pytest) to isolate `v2_to_legacy` and `normalize_error_response` behavior.
+- Add integration toggle so mapping can be enabled as a proxy layer in front of real `/api/v2/orders`.
+- Improve mapping heuristics for currency conversion or different fallback policies for `state`.
+
+If you want, I can:
+- Add pytest unit tests next (covering corner cases: missing customer fields, malformed amount, empty lineItems).
+- Implement a small WSGI/Flask shim demonstrating the live compatibility gateway.
+
+Would you like me to add pytest tests next?
+
+Made changes.

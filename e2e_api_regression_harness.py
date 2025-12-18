@@ -217,9 +217,20 @@ def request_json(method: str, path: str, query: Dict[str, str]) -> Tuple[int, Di
                 return c["response"]["statusCode"], c["response"]["body"]
         raise RuntimeError(f"No canned response for {method} {path} {query}")
 
-    # TODO: implement real HTTP call here
-    # Hint: requests.request(method, base_url+path, params=query, timeout=...)
-    raise NotImplementedError("TODO: implement real HTTP call using BASE_URL")
+        # Use requests to call real API when BASE_URL is set
+    try:
+        import requests
+    except ImportError as e:
+        raise RuntimeError("requests module required for real HTTP calls; install it via requirements.txt") from e
+    url = base_url.rstrip('/') + path
+    response = requests.request(method, url, params=query, timeout=10)
+    # Raise for HTTP errors
+    response.raise_for_status()
+    try:
+        body = response.json()
+    except ValueError as e:
+        raise RuntimeError(f"Response from {url} is not JSON") from e
+    return response.status_code, body
 
 
 # -------------------------
@@ -239,8 +250,64 @@ def v2_to_legacy(order_v2: Dict[str, Any]) -> Dict[str, Any]:
 
     Must be deterministic and stable.
     """
-    # TODO: implement mapping rules
-    raise NotImplementedError("TODO: implement v2_to_legacy mapping")
+    # Map 'state' → 'status'
+    state = order_v2.get('state')
+    if state in LEGACY_ENUM:
+        status = state
+    else:
+        # Deterministic fallback: map unknown states to a safe legacy value
+        # Here we choose 'PAID' as a reasonable default
+        status = 'PAID'
+
+    # Map amount{value, currency} → totalPrice (float), default to 0.0
+    amt = order_v2.get('amount')
+    if isinstance(amt, dict):
+        total = amt.get('value', 0.0)
+    else:
+        total = float(amt) if isinstance(amt, (int, float)) else 0.0
+
+    # Flatten customer -> customerId, customerName
+    cust = order_v2.get('customer', {}) or {}
+    customer_id = cust.get('id') or ''
+    customer_name = cust.get('name') or ''
+
+    # Convert createdAt ISO8601 -> YYYY-MM-DD
+    created_at = order_v2.get('createdAt') or ''
+    # fallback: try to parse ISO string and extract date part
+    if isinstance(created_at, str) and 'T' in created_at:
+        created_at_date = created_at.split('T')[0]
+    else:
+        created_at_date = created_at
+
+    # Map lineItems -> items(productName, qty)
+    line_items = order_v2.get('lineItems') or []
+    items = []
+    if isinstance(line_items, list) and line_items:
+        for li in line_items:
+            if isinstance(li, dict):
+                items.append({
+                    "productName": li.get('name', ''),
+                    "qty": li.get('quantity') if isinstance(li.get('quantity'), (int, float)) else 0
+                })
+    # Guarantee items exists and non-empty for legacy safety
+    if not items:
+        items = [{"productName": "unknown", "qty": 0}]
+
+    legacy = {
+        "orderId": order_v2.get('orderId'),
+        "status": status,
+        "totalPrice": total,
+        "items": items,
+        "customerId": customer_id,
+        "customerName": customer_name,
+        "createdAt": created_at_date,
+    }
+
+    # Pass through trackingNumber if present
+    if 'trackingNumber' in order_v2:
+        legacy['trackingNumber'] = order_v2['trackingNumber']
+
+    return legacy
 
 
 # -------------------------
@@ -255,8 +322,12 @@ def classify_v1_deprecation(status_code: int, body: Dict[str, Any]) -> str:
       - 200 => OK
       - anything else => OUTAGE
     """
-    # TODO: implement classification
-    raise NotImplementedError("TODO: implement classify_v1_deprecation")
+    # 410 with API_VERSION_DEPRECATED -> DEPRECATED
+    if status_code == 410 and body.get('error') == 'API_VERSION_DEPRECATED':
+        return 'DEPRECATED'
+    if status_code == 200:
+        return 'OK'
+    return 'OUTAGE'
 
 
 # -------------------------
@@ -275,35 +346,88 @@ def normalize_error_response(status_code: int, body: Dict[str, Any]) -> Dict[str
       - If already v1 format, pass through
       - Must be deterministic
     """
-    # TODO: implement error response normalization
-    raise NotImplementedError("TODO: implement normalize_error_response")
+    # If v2-style errors array exists, map first entry to v1 format
+    if isinstance(body, dict):
+        if 'errors' in body and isinstance(body['errors'], list) and body['errors']:
+            first = body['errors'][0]
+            return {
+                'error': first.get('code', 'UNKNOWN_ERROR'),
+                'message': first.get('message', '')
+            }
+        if 'error' in body and 'message' in body:
+            # Already v1 format
+            return {'error': body['error'], 'message': body.get('message', '')}
+    # Fallback: generic use status; but caller should supply status_code
+    return {'error': 'UNKNOWN_ERROR', 'message': ''}
 
 
 # -------------------------
 # Checks
 # -------------------------
 
-def check_raw_v2_breaks_legacy_items_missing() -> CheckResult:
+def check_raw_v2_expected_legacy_items_present() -> CheckResult:
     status, body = request_json("GET", "/api/v2/orders", {"userId": "123"})
     if status != 200:
         return _fail("raw v2: expected 200", f"got {status}")
-    # Legacy expects items[]; raw v2 does not provide it.
-    if "items" in body:
-        return _fail("raw v2 breaks legacy: items should be missing in v2", "unexpected items present")
-    return _pass("raw v2 breaks legacy: items missing as expected")
+    # Legacy expects items[] to be present and non-empty; raw v2 will not provide it -> fail
+    if "items" not in body or not isinstance(body.get("items"), list) or not body.get("items"):
+        return _fail("raw v2 fails legacy: missing or empty items", "items missing or empty")
+    return _pass("raw v2 provides expected legacy items")
 
 
-def check_raw_v2_breaks_legacy_enum_on_new_state() -> CheckResult:
+def check_raw_v2_nested_customer_not_flat() -> CheckResult:
+    """Raw v2 has nested customer object; legacy expects flat fields -> fail"""
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "123"})
+    if status != 200:
+        return _fail("raw v2 nested: expected 200", f"got {status}")
+    if "customer" in body and isinstance(body.get("customer"), dict):
+        return _fail("raw v2 nested customer not flat as expected", f"customer={body['customer']}")
+    return _pass("raw v2 nested customer passed unexpectedly")
+
+
+def check_raw_v2_amount_object_not_float() -> CheckResult:
+    """Raw v2 has amount as object; legacy expects totalPrice numeric -> fail"""
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "555", "includeItems": "false"})
+    if status != 200:
+        return _fail("raw v2 amount: expected 200", f"got {status}")
+    amt = body.get("amount")
+    if isinstance(amt, dict):
+        return _fail("raw v2 amount is object, not numeric", f"amount={amt}")
+    return _pass("raw v2 amount is numeric unexpectedly")
+
+
+def check_raw_v2_createdAt_iso_format() -> CheckResult:
+    """Raw v2 uses ISO8601 createdAt; legacy expects YYYY-MM-DD -> fail"""
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "123"})
+    if status != 200:
+        return _fail("raw v2 createdAt: expected 200", f"got {status}")
+    created = body.get("createdAt")
+    if isinstance(created, str) and 'T' in created:
+        return _fail("raw v2 createdAt ISO8601 format", f"createdAt={created}")
+    return _pass("raw v2 createdAt appears non-ISO")
+
+
+def check_raw_v2_error_is_array() -> CheckResult:
+    """Raw v2 error response uses 'errors' array; legacy expects single error fields -> fail"""
+    status, body = request_json("GET", "/api/v2/orders", {"userId": "invalid"})
+    if status != 400:
+        return _fail("raw v2 error: expected 400", f"got {status}")
+    if 'errors' in body and isinstance(body['errors'], list):
+        return _fail("raw v2 uses errors array", f"errors={body['errors']}")
+    return _pass("raw v2 error format passed unexpectedly")
+
+
+def check_raw_v2_expected_legacy_enum_safe() -> CheckResult:
     status, body = request_json("GET", "/api/v2/orders", {"userId": "555", "includeItems": "false"})
     if status != 200:
         return _fail("raw v2: expected 200 for enum case", f"got {status}")
     state = body.get("state")
     if not state:
         return _fail("raw v2: state missing", "no state")
-    # If state is new, legacy strict enum would crash (simulated).
+    # Legacy expects state to be one of LEGACY_ENUM; raw v2 may be new -> fail
     if state not in LEGACY_ENUM:
-        return _pass("raw v2 breaks legacy enum: new state detected", f"state={state}")
-    return _fail("raw v2 breaks legacy enum: expected new value", f"state={state} is legacy-known")
+        return _fail("raw v2 fails legacy enum: new state detected", f"state={state}")
+    return _pass("raw v2 provides legacy-safe enum value")
 
 
 def check_compat_mapping_produces_legacy_shape() -> CheckResult:
@@ -415,15 +539,28 @@ def check_v1_deprecation_classified_not_outage() -> CheckResult:
 
 
 def main() -> None:
-    results = [
-        check_raw_v2_breaks_legacy_items_missing(),
-        check_raw_v2_breaks_legacy_enum_on_new_state(),
-        check_nested_structure_flattened(),
-        check_type_change_amount_object(),
-        check_compat_mapping_produces_legacy_shape(),
-        check_error_format_normalized(),
-        check_v1_deprecation_classified_not_outage(),
-    ]
+    mode = os.environ.get("MODE", "raw").lower()
+    if mode == "raw":
+        # In raw mode we assert legacy expectations and expect failures (raw v2 should break legacy)
+        results = [
+            check_raw_v2_expected_legacy_items_present(),
+            check_raw_v2_expected_legacy_enum_safe(),
+            check_raw_v2_nested_customer_not_flat(),
+            check_raw_v2_amount_object_not_float(),
+            check_raw_v2_createdAt_iso_format(),
+            check_raw_v2_error_is_array(),
+            check_error_format_normalized(),
+            check_v1_deprecation_classified_not_outage(),
+        ]
+    else:
+        # compat mode: use mapping to adapt v2 shape -> legacy safe
+        results = [
+            check_nested_structure_flattened(),
+            check_type_change_amount_object(),
+            check_compat_mapping_produces_legacy_shape(),
+            check_error_format_normalized(),
+            check_v1_deprecation_classified_not_outage(),
+        ]
     print_report(results)
 
 

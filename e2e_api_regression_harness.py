@@ -217,9 +217,19 @@ def request_json(method: str, path: str, query: Dict[str, str]) -> Tuple[int, Di
                 return c["response"]["statusCode"], c["response"]["body"]
         raise RuntimeError(f"No canned response for {method} {path} {query}")
 
-    # TODO: implement real HTTP call here
-    # Hint: requests.request(method, base_url+path, params=query, timeout=...)
-    raise NotImplementedError("TODO: implement real HTTP call using BASE_URL")
+    # Real HTTP call mode
+    try:
+        import requests
+    except ImportError:
+        raise ImportError("requests library required for BASE_URL mode. Install with: pip install requests")
+    
+    url = base_url.rstrip('/') + path
+    resp = requests.request(method, url, params=query, timeout=10)
+    try:
+        json_body = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"Response is not valid JSON: {resp.text}") from e
+    return resp.status_code, json_body
 
 
 # -------------------------
@@ -239,8 +249,69 @@ def v2_to_legacy(order_v2: Dict[str, Any]) -> Dict[str, Any]:
 
     Must be deterministic and stable.
     """
-    # TODO: implement mapping rules
-    raise NotImplementedError("TODO: implement v2_to_legacy mapping")
+    legacy = {}
+    
+    # Pass through orderId if present
+    if "orderId" in order_v2:
+        legacy["orderId"] = order_v2["orderId"]
+    
+    # Map state -> status with enum downgrade
+    state = order_v2.get("state", "UNKNOWN")
+    if state in LEGACY_ENUM:
+        legacy["status"] = state
+    else:
+        # Deterministic downgrade for unknown states
+        # FULFILLED -> map to PAID (closest semantic match)
+        downgrade_map = {"FULFILLED": "PAID"}
+        legacy["status"] = downgrade_map.get(state, "PAID")
+    
+    # Convert amount object to totalPrice float
+    amount = order_v2.get("amount", {})
+    if isinstance(amount, dict):
+        legacy["totalPrice"] = float(amount.get("value", 0.0))
+    else:
+        # Fallback: if amount is primitive, use it
+        legacy["totalPrice"] = float(amount) if amount else 0.0
+    
+    # Flatten nested customer object
+    customer = order_v2.get("customer", {})
+    if isinstance(customer, dict):
+        legacy["customerId"] = customer.get("id", "")
+        legacy["customerName"] = customer.get("name", "")
+        # email is dropped (legacy doesn't expect it)
+    else:
+        legacy["customerId"] = ""
+        legacy["customerName"] = ""
+    
+    # Convert lineItems to items and drop extra fields
+    line_items = order_v2.get("lineItems", [])
+    items = []
+    if isinstance(line_items, list):
+        for li in line_items:
+            # Keep only productName (map from name) and qty (map from quantity)
+            items.append({
+                "productName": li.get("name", ""),
+                "qty": li.get("quantity", 0)
+            })
+    
+    # Guarantee non-empty items list for legacy UI safety
+    if not items:
+        items = [{"productName": "Unknown", "qty": 0}]
+    legacy["items"] = items
+    
+    # Convert createdAt from ISO 8601 to YYYY-MM-DD
+    created_at = order_v2.get("createdAt", "")
+    if created_at:
+        # Extract YYYY-MM-DD from ISO 8601 format (first 10 chars)
+        legacy["createdAt"] = created_at[:10]
+    else:
+        legacy["createdAt"] = "1970-01-01"
+    
+    # Pass through trackingNumber if present
+    if "trackingNumber" in order_v2:
+        legacy["trackingNumber"] = order_v2["trackingNumber"]
+    
+    return legacy
 
 
 # -------------------------
@@ -255,8 +326,17 @@ def classify_v1_deprecation(status_code: int, body: Dict[str, Any]) -> str:
       - 200 => OK
       - anything else => OUTAGE
     """
-    # TODO: implement classification
-    raise NotImplementedError("TODO: implement classify_v1_deprecation")
+    if status_code == 200:
+        return "OK"
+    
+    if status_code == 410:
+        # Check if error indicates deprecation
+        error = body.get("error", "")
+        if error == "API_VERSION_DEPRECATED":
+            return "DEPRECATED"
+    
+    # Anything else (including 410 without deprecation marker)
+    return "OUTAGE"
 
 
 # -------------------------
@@ -275,8 +355,24 @@ def normalize_error_response(status_code: int, body: Dict[str, Any]) -> Dict[str
       - If already v1 format, pass through
       - Must be deterministic
     """
-    # TODO: implement error response normalization
-    raise NotImplementedError("TODO: implement normalize_error_response")
+    # Check if already v1 format
+    if "error" in body and "message" in body:
+        return body  # Already v1 format, pass through
+    
+    # Check for v2 errors array format
+    if "errors" in body and isinstance(body["errors"], list) and len(body["errors"]) > 0:
+        first_error = body["errors"][0]
+        # Map first error from v2 format to v1 format
+        return {
+            "error": first_error.get("code", "UNKNOWN_ERROR"),
+            "message": first_error.get("message", "An error occurred")
+        }
+    
+    # Fallback for unexpected formats
+    return {
+        "error": "UNKNOWN_ERROR",
+        "message": "An error occurred"
+    }
 
 
 # -------------------------
